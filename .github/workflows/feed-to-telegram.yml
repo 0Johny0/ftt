@@ -1,0 +1,98 @@
+name: GitHub activity to Telegram
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/github-script@v7
+        env:
+          GITHUB_USERNAME: 0Johny0
+          GH_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const statePath = ".github/feed-state.json";
+
+            const seen = fs.existsSync(statePath)
+              ? new Set(JSON.parse(fs.readFileSync(statePath, "utf8")))
+              : null;
+
+            const response = await fetch(
+              `https://api.github.com/users/${process.env.GITHUB_USERNAME}/received_events?per_page=100`,
+              {
+                headers: {
+                  Accept: "application/vnd.github+json",
+                  Authorization: `Bearer ${process.env.GH_TOKEN}`,
+                  "X-GitHub-Api-Version": "2022-11-28",
+                },
+              }
+            );
+
+            if (!response.ok) {
+              throw new Error(`GitHub API returned ${response.status}`);
+            }
+
+            const events = await response.json();
+            const ids = events.map((event) => String(event.id));
+
+            // 首次运行只记录已有活动，不把旧活动一次性推送出来。
+            if (seen === null) {
+              fs.writeFileSync(statePath, JSON.stringify(ids, null, 2) + "\n");
+              console.log("Initialized feed state; no notifications sent.");
+              return;
+            }
+
+            const fresh = events
+              .filter((event) => !seen.has(String(event.id)))
+              .reverse();
+
+            for (const event of fresh) {
+              const repo = event.repo?.name;
+              const actor = event.actor?.login ?? "Someone";
+              const text = [
+                `${event.type} by ${actor}`,
+                repo ? `Repository: ${repo}` : "",
+                repo ? `https://github.com/${repo}` : "",
+              ].filter(Boolean).join("\n");
+
+              const telegramResponse = await fetch(
+                `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    chat_id: process.env.TELEGRAM_CHAT_ID,
+                    text,
+                  }),
+                }
+              );
+
+              if (!telegramResponse.ok) {
+                throw new Error(`Telegram API returned ${telegramResponse.status}`);
+              }
+            }
+
+            const updated = [...new Set([...ids, ...seen])].slice(0, 300);
+            fs.writeFileSync(statePath, JSON.stringify(updated, null, 2) + "\n");
+
+      - name: Save feed state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/feed-state.json
+          git diff --cached --quiet || (
+            git commit -m "Update feed polling state"
+            git push
+          )
